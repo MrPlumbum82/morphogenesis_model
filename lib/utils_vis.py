@@ -1,9 +1,4 @@
 import numpy as np
-import torch
-import torch.nn as nn
-import torch.optim as optim
-import torch.nn.functional as F
-
 class SamplePool:
     def __init__(self, *, _parent=None, _parent_idx=None, **slots):
         self._parent = _parent
@@ -30,12 +25,8 @@ def to_alpha(x):
     return np.clip(x[..., 3:4], 0, 0.9999)
 
 def to_rgb(x):
-    # assume rgb premultiplied by alpha
     rgb, a = x[..., :3], to_alpha(x)
     return np.clip(1.0-a+rgb, 0, 0.9999)
-
-def get_living_mask(x):
-    return nn.MaxPool2d(3, stride=1, padding=1)(x[:, 3:4, :, :])>0.1
 
 def make_seeds(shape, n_channels, n=1):
     x = np.zeros([n, shape[0], shape[1], n_channels], np.float32)

@@ -1,13 +1,11 @@
 import pygame
-import numpy as np
-
 class displayer:
 
     def __init__(self, _map_shape, pix_size, has_gap=False):
         """
         _map_size: tuple
-        color_map: a list indicates the color to each index.
-                   0 : empty block, should always white
+        color_map: a list for the color to each index.
+                   0 : empty block
                    1+: varies building types
         """
         pygame.init()
