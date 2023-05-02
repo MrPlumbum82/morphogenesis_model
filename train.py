@@ -1,227 +1,147 @@
 #!/usr/bin/env python3
-import argparse
-import pathlib
+import time
+import io
+import imageio
+import requests
+import PIL.Image, PIL.ImageDraw
 
 import numpy as np
+import matplotlib.pyplot as plt
 import torch
-from torch.utils.tensorboard import SummaryWriter
 import torch.nn as nn
-from PIL import Image
-from tqdm import tqdm
+import torch.optim as optim
+import torch.nn.functional as F
 
-from model import CAModel
+from IPython.display import clear_output
 
+from lib.CAModel import CAModel
+from lib.utils_vis import SamplePool, to_alpha, to_rgb, get_living_mask, make_seed, make_circle_masks
 
-def load_image(path, size=40):
-    """Load an image.
+device = torch.device("cuda:0")
+model_path = "models/heart.pth"
 
-    Parameters
-    ----------
-    path : pathlib.Path
-        Path to where the image is located. Note that the image needs to be
-        RGBA.
+CHANNEL_N = 16        # Number of CA state channels
+TARGET_PADDING = 16   # Number of pixels used to pad the target image border
+TARGET_SIZE = 40
 
-    size : int
-        The image will be resized to a square wit ha side length of `size`.
+lr = 2e-3
+lr_gamma = 0.9999
+betas = (0.5, 0.5)
+n_epoch = 8000
 
-    Returns
-    -------
-    torch.Tensor
-        4D float image of shape `(1, 4, size, size)`. The RGB channels
-        are premultiplied by the alpha channel.
-    """
-    img = Image.open(path)
-    img = img.resize((size, size), Image.ANTIALIAS)
-    img = np.float32(img) / 255.0
-    img[..., :3] *= img[..., 3:]
+BATCH_SIZE = 8
+POOL_SIZE = 1024
+CELL_FIRE_RATE = 0.5
 
-    return torch.from_numpy(img).permute(2, 0, 1)[None, ...]
+TARGET_EMOJI = 0 #@param "🦎"
 
+EXPERIMENT_TYPE = "Regenerating"
+EXPERIMENT_MAP = {"Growing":0, "Persistent":1, "Regenerating":2}
+EXPERIMENT_N = EXPERIMENT_MAP[EXPERIMENT_TYPE]
 
-def to_rgb(img_rgba):
-    """Convert RGBA image to RGB image.
+USE_PATTERN_POOL = [0, 1, 1][EXPERIMENT_N]
+DAMAGE_N = [0, 0, 3][EXPERIMENT_N]  # Number of patterns to damage in a batch
 
-    Parameters
-    ----------
-    img_rgba : torch.Tensor
-        4D tensor of shape `(1, 4, size, size)` where the RGB channels
-        were already multiplied by the alpha.
+def load_image(url, max_size=TARGET_SIZE):
+  r = requests.get(url)
+  img = PIL.Image.open(io.BytesIO(r.content))
+  img.thumbnail((max_size, max_size), PIL.Image.ANTIALIAS)
+  img = np.float32(img)/255.0
+  # premultiply RGB by Alpha
+  img[..., :3] *= img[..., 3:]
+  return img
 
-    Returns
-    -------
-    img_rgb : torch.Tensor
-        4D tensor of shape `(1, 3, size, size)`.
-    """
-    rgb, a = img_rgba[:, :3, ...], torch.clamp(img_rgba[:, 3:, ...], 0, 1)
-    return torch.clamp(1.0 - a + rgb, 0, 1)
+def load_emoji(index, path="data/usa.png"):
+    url = 'https://em-content.zobj.net/thumbs/120/google/350/red-heart_2764-fe0f.png'
+    target_img = load_image(url, 48)
+    return target_img
+    #im = imageio.imread(path)
+    #emoji = np.array(im[:, index*40:(index+1)*40].astype(np.float32))
+    #emoji /= 255.0
+    #return emoji
 
+def visualize_batch(x0, x):
+    vis0 = to_rgb(x0)
+    vis1 = to_rgb(x)
+    print('batch (before/after):')
+    plt.figure(figsize=[15,5])
+    for i in range(x0.shape[0]):
+        plt.subplot(2,x0.shape[0],i+1)
+        plt.imshow(vis0[i])
+        plt.axis('off')
+    for i in range(x0.shape[0]):
+        plt.subplot(2,x0.shape[0],i+1+x0.shape[0])
+        plt.imshow(vis1[i])
+        plt.axis('off')
+    plt.show()
 
-def make_seed(size, n_channels):
-    """Create a starting tensor for training.
+def plot_loss(loss_log):
+    plt.figure(figsize=(10, 4))
+    plt.title('Loss history (log10)')
+    plt.plot(np.log10(loss_log), '.', alpha=0.1)
+    #plt.show()
 
-    The only active pixels are going to be in the middle.
+target_img = load_emoji(TARGET_EMOJI)
+#plt.figure(figsize=(4,4))
+#plt.imshow(to_rgb(target_img))
+#plt.show()
 
-    Parameters
-    ----------
-    size : int
-        The height and the width of the tensor.
+p = TARGET_PADDING
+pad_target = np.pad(target_img, [(p, p), (p, p), (0, 0)])
+h, w = pad_target.shape[:2]
+pad_target = np.expand_dims(pad_target, axis=0)
+pad_target = torch.from_numpy(pad_target.astype(np.float32)).to(device)
 
-    n_channels : int
-        Overall number of channels. Note that it needs to be higher than 4
-        since the first 4 channels represent RGBA.
+seed = make_seed((h, w), CHANNEL_N)
+pool = SamplePool(x=np.repeat(seed[None, ...], POOL_SIZE, 0))
+batch = pool.sample(BATCH_SIZE).x
 
-    Returns
-    -------
-    torch.Tensor
-        4D float tensor of shape `(1, n_chanels, size, size)`.
-    """
-    x = torch.zeros((1, n_channels, size, size), dtype=torch.float32)
-    x[:, 3:, size // 2, size // 2] = 1
-    return x
+ca = CAModel(CHANNEL_N, CELL_FIRE_RATE, device).to(device)
+ca.load_state_dict(torch.load(model_path))
 
+optimizer = optim.Adam(ca.parameters(), lr=lr, betas=betas)
+scheduler = optim.lr_scheduler.ExponentialLR(optimizer, lr_gamma)
 
-def main(argv=None):
-    parser = argparse.ArgumentParser(
-            description="Training script for the Celluar Automata"
-    )
-    parser.add_argument("img", type=str, help="Path to the image we want to reproduce")
+loss_log = []
 
-    parser.add_argument(
-            "-b",
-            "--batch-size",
-            type=int,
-            default=8,
-            help="Batch size. Samples will always be taken randomly from the pool."
-    )
-    parser.add_argument(
-            "-d",
-            "--device",
-            type=str,
-            default="cpu",
-            help="Device to use",
-            choices=("cpu", "cuda"),
-    )
-    parser.add_argument(
-            "-e",
-            "--eval-frequency",
-            type=int,
-            default=500,
-            help="Evaluation frequency.",
-    )
-    parser.add_argument(
-            "-i",
-            "--eval-iterations",
-            type=int,
-            default=300,
-            help="Number of iterations when evaluating.",
-    )
-    parser.add_argument(
-            "-n",
-            "--n-batches",
-            type=int,
-            default=5000,
-            help="Number of batches to train for.",
-    )
-    parser.add_argument(
-            "-c",
-            "--n-channels",
-            type=int,
-            default=16,
-            help="Number of channels of the input tensor",
-    )
-    parser.add_argument(
-            "-l",
-            "--logdir",
-            type=str,
-            default="logs",
-            help="Folder where all the logs and outputs are saved.",
-    )
-    parser.add_argument(
-            "-p",
-            "--padding",
-            type=int,
-            default=16,
-            help="Padding. The shape after padding is (h + 2 * p, w + 2 * p).",
-    )
-    parser.add_argument(
-            "--pool-size",
-            type=int,
-            default=1024,
-            help="Size of the training pool",
-    )
-    parser.add_argument(
-            "-s",
-            "--size",
-            type=int,
-            default=40,
-            help="Image size",
-    )
-    # Parse arguments
-    args = parser.parse_args()
-    print(vars(args))
+def train(x, target, steps, optimizer, scheduler):
+    x = ca(x, steps=steps)
+    loss = F.mse_loss(x[:, :, :, :4], target)
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+    scheduler.step()
+    return x, loss
 
-    # Misc
-    device = torch.device(args.device)
+def loss_f(x, target):
+    return torch.mean(torch.pow(x[..., :4]-target, 2), [-2,-3,-1])
 
-    log_path = pathlib.Path(args.logdir)
-    log_path.mkdir(parents=True, exist_ok=True)
-    writer = SummaryWriter(log_path)
+for i in range(n_epoch+1):
+    if USE_PATTERN_POOL:
+        batch = pool.sample(BATCH_SIZE)
+        x0 = torch.from_numpy(batch.x.astype(np.float32)).to(device)
+        loss_rank = loss_f(x0, pad_target).detach().cpu().numpy().argsort()[::-1]
+        x0 = batch.x[loss_rank]
+        x0[:1] = seed
+        if DAMAGE_N:
+            damage = 1.0-make_circle_masks(DAMAGE_N, h, w)[..., None]
+            x0[-DAMAGE_N:] *= damage
+    else:
+        x0 = np.repeat(seed[None, ...], BATCH_SIZE, 0)
+    x0 = torch.from_numpy(x0.astype(np.float32)).to(device)
 
-    # Target image
-    target_img_ = load_image(args.img, size=args.size)
-    p = args.padding
-    target_img_ = nn.functional.pad(target_img_, (p, p, p, p), "constant", 0)
-    target_img = target_img_.to(device)
-    target_img = target_img.repeat(args.batch_size, 1, 1, 1)
+    x, loss = train(x0, pad_target, np.random.randint(64,96), optimizer, scheduler)
 
-    writer.add_image("ground truth", to_rgb(target_img_)[0])
+    if USE_PATTERN_POOL:
+        batch.x[:] = x.detach().cpu().numpy()
+        batch.commit()
 
-    # Model and optimizer
-    model = CAModel(n_channels=args.n_channels, device=device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=2e-3)
+    step_i = len(loss_log)
+    loss_log.append(loss.item())
 
-    # Pool initialization
-    seed = make_seed(args.size, args.n_channels).to(device)
-    seed = nn.functional.pad(seed, (p, p, p, p), "constant", 0)
-    pool = seed.clone().repeat(args.pool_size, 1, 1, 1)
-
-    for it in tqdm(range(args.n_batches)):
-        batch_ixs = np.random.choice(
-                args.pool_size, args.batch_size, replace=False
-        ).tolist()
-
-        x = pool[batch_ixs]
-        for i in range(np.random.randint(64, 96)):
-            x = model(x)
-
-        loss_batch = ((target_img - x[:, :4, ...]) ** 2).mean(dim=[1, 2, 3])
-        loss = loss_batch.mean()
-
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-        writer.add_scalar("train/loss", loss, it)
-
-        argmax_batch = loss_batch.argmax().item()
-        argmax_pool = batch_ixs[argmax_batch]
-        remaining_batch = [i for i in range(args.batch_size) if i != argmax_batch]
-        remaining_pool = [i for i in batch_ixs if i != argmax_pool]
-
-        pool[argmax_pool] = seed.clone()
-        pool[remaining_pool] = x[remaining_batch].detach()
-
-        if it % args.eval_frequency == 0:
-            x_eval = seed.clone()  # (1, n_channels, size, size)
-
-            eval_video = torch.empty(1, args.eval_iterations, 3, *x_eval.shape[2:])
-
-            for it_eval in range(args.eval_iterations):
-                x_eval = model(x_eval)
-                x_eval_out = to_rgb(x_eval[:, :4].detach().cpu())
-                eval_video[0, it_eval] = x_eval_out
-
-            writer.add_video("eval", eval_video, it, fps=60)
-
-
-if __name__ == "__main__":
-    main()
+    if step_i%100 == 0:
+        clear_output()
+        print(step_i, "loss =", loss.item())
+        visualize_batch(x0.detach().cpu().numpy(), x.detach().cpu().numpy())
+        plot_loss(loss_log)
+        torch.save(ca.state_dict(), model_path)
